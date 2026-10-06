@@ -8,6 +8,9 @@
 3. **写操作幂等**——同键重放返回首次结果且无额外副作用，同键不同载荷被拒绝；
 4. **可审计**——放行与拒绝全部留痕、可关联调用方，审计内容不含明文凭据。
 
+本轮新增：**批量写入按条计费**、**每路由全调用方共享容量上限**、
+**调用方自助用量查询**，三者与既有版本/凭据/幂等规则完全正交。
+
 ## 1. 版本策略
 
 - 调用方用请求头 **`X-Api-Version`** 选择版本；
@@ -26,7 +29,10 @@
 `400 version_unknown` / `410 version_retired` ≠ `401 *` / `403 forbidden`。
 
 **跨版本一致性**：`v1/v2/v3` 共用同一套业务处理，返回 `data` 部分完全一致，
-只有外层 `api_version` 与弃用响应头不同。
+只有外层 `api_version` 与弃用响应头不同。本轮新增的批量写入、共享容量上限与
+`GET /usage` 在三个可用版本上行为一致；不指定版本时仍走默认 `v2`，
+版本协商失败（`400 version_unknown` / `410 version_retired`）依旧最先返回，
+凭据与权限判定不受新逻辑影响。
 
 ## 2. 凭据规则
 
@@ -57,34 +63,82 @@
 | `test-key-revoked` | acct-revoked | 已撤销 |
 | `test-key-readonly` | acct-readonly | 只有读权限域 |
 
-## 3. 配额规则
+## 3. 配额与共享容量
+
+### 3.1 按量计费规则
 
 - 粒度：**每凭据 × 每路由**，固定窗口（默认 3600 秒），互不影响；
+- **单条写入** `POST /widgets`：每次成功写入扣 **1** 份，行为与之前完全一致；
+- **批量写入** `POST /widgets/batch`：一次提交多条记录
+  （`{"items": [{"name": ...}, ...]}`，上限 100 条），
+  按**实际写成功的条数**扣费；批量与单条共用同一个 `widgets:create` 额度桶；
 - 扣减是锁内原子操作：并发请求不会超发，被拒请求不计数；
+- **整批原子性**：剩余额度不足以覆盖整批时，整批拒绝——
+  不存在"只写一部分"或"先扣再退"的中间状态；被拒的请求从头到尾不占额度；
+- **失败全退**：已占额度后业务处理失败（如某条记录校验不通过 422），
+  本次占用的额度**全部退回**，幂等占位同时释放，同键可安全重试；
 - **不多扣**：
   - 版本/认证/权限阶段被拒的请求根本不进入配额阶段；
   - 写路由先判幂等：**重放与同键冲突在获取配额之前就返回，完全不碰配额**；
-  - 已通过配额但业务处理失败（如 422）会回滚配额并释放幂等占位；
-- **不漏扣**：只有真正首次执行副作用的请求扣 1 次；
-- 超限时返回 `429 quota_exceeded`，并给出可重试信息：
-  `Retry-After` 头 + 体中 `retry_after_seconds / reset_at / used / limit`；
-- 允许的请求带 `X-RateLimit-Limit` / `X-RateLimit-Remaining`。
+- **不漏扣**：只有真正首次执行副作用的请求按写入条数扣费；
+- 超限返回 `429`，允许的请求带 `X-RateLimit-Limit` / `X-RateLimit-Remaining`。
+
+### 3.2 每路由共享容量上限（兜底保护后端）
+
+- 每条路由另有一个**所有调用方共享**的总容量上限（`store.ROUTE_CAPACITY`），
+  与每凭据配额同窗口、同样锁内原子扣减；
+- 并发下严格不超：多个不同调用方同时挤同一条路由，共享上限也不会被突破；
+- 写路由扣费顺序：**先扣自有配额，再占共享容量**；共享容量不足时，
+  刚扣的自有配额立即退回——路由整体满了不会误伤调用方自己的额度；
+- 两种 429 可明确区分，各自带 `Retry-After` 头与 `retry_after_seconds / reset_at`：
+
+| 情况 | error.code | details.scope |
+|------|------------|---------------|
+| 自有额度不足 | `quota_exceeded` | `per_credential_quota` |
+| 路由共享容量已满 | `capacity_exceeded` | `shared_route_capacity` |
+
+- 种子配置：读路由共享容量 1000/窗口；写路由共享容量 **8**/窗口
+  （每凭据 create 限额 5，两个调用方即可触顶，便于本地观察）。
+
+### 3.3 用量自助查询
+
+`GET /usage`（需有效凭据，不需要特定权限域）返回当前窗口水位：
+
+```json
+{
+  "api_version": "v2",
+  "data": {
+    "key_id": "acct-active",
+    "window_seconds": 3600,
+    "routes": {
+      "widgets:create": {
+        "quota":           {"used": 3, "limit": 5, "remaining": 2, "reset_at": "..."},
+        "shared_capacity": {"used": 3, "limit": 8, "remaining": 5, "reset_at": "..."}
+      }
+    }
+  }
+}
+```
+
+- 查询**不消耗任何额度、不改动任何状态**（只读快照，可放心轮询）；
+- 不同调用方看到的 `shared_capacity` 一致，`quota` 各自独立。
 
 准入顺序（写路由）：
-`版本 → 凭据 → 权限 → 幂等判定(重放/冲突短路) → 配额(仅首写者) → 副作用`。
+`版本 → 凭据 → 权限 → 幂等判定(重放/冲突短路) → 自有配额(按条) → 共享容量(按条) → 副作用`。
 
 ## 4. 幂等语义
 
-- 写请求 `POST /widgets` 必须带 **`Idempotency-Key`** 头，否则 `400 bad_request`；
+- 写请求 `POST /widgets` 与 `POST /widgets/batch` 都必须带 **`Idempotency-Key`** 头，
+  否则 `400 bad_request`；
 - 请求载荷经规范化 JSON 的 SHA-256 作为指纹，与键、调用方、路由一起绑定；
 - **首次提交**：执行唯一一次副作用，返回 `201`；
 - **同键同载荷重放**（含并发重复）：直接返回首次的状态码与响应体，
   响应带 `Idempotent-Replay: true` 且体中 `idempotent_replay: true`，
-  **不新增 widget、不扣配额**；
+  **不新增 widget、不扣配额**（批量同样只按首次的条数扣一次）；
 - **同键不同载荷 / 不同调用方 / 不同路由**：返回 `409 idempotency_conflict`，
   首次结果不被覆盖；
 - 首写者并发重复时，重复请求等待首写完成后拿到同一份结果（首写者语义）；
-- 首写者在完成前失败会释放占位并回滚配额，调用方可安全用同一键重试。
+- 首写者在完成前失败会释放占位并回滚全部已占额度，调用方可安全用同一键重试。
 
 ## 5. 审计
 
@@ -101,7 +155,8 @@ decision, reason, quota_before, quota_after, detail`。
 # 安装依赖（需要 Python 3.14）
 uv sync
 
-# 运行全部单测（含并发配额竞争、凭据轮换/过期、版本边界、幂等重放/冲突）
+# 运行全部单测（含并发配额竞争、批量整批拒绝/回退、共享容量竞争、
+# 用量查询免扣费、凭据轮换/过期、版本边界、幂等重放/冲突）
 uv run pytest                      # 终端会打印每个用例的关键输入与判定依据
 
 # 启动服务
@@ -140,6 +195,27 @@ seq 60 | xargs -P60 -I{} curl -s -o /dev/null -w '%{http_code}\n' -XPOST \
   -H 'X-Api-Key: test-key-active' -H 'Idempotency-Key: c-{}' \
   -H 'Content-Type: application/json' -d '{"name":"n{}"}' localhost:8000/widgets \
   | sort | uniq -c
+
+# 批量写入：3 条 -> 201，按 3 份扣费；同键重放不重复扣
+curl -s -XPOST -H 'X-Api-Key: test-key-active' -H 'Idempotency-Key: batch-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"name":"b1"},{"name":"b2"},{"name":"b3"}]}' \
+  localhost:8000/widgets/batch
+
+# 整批原子拒绝：上一步已用 3/5，再提 3 条 -> 429 quota_exceeded，一条都不写
+curl -s -XPOST -H 'X-Api-Key: test-key-active' -H 'Idempotency-Key: batch-2' \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"name":"x"},{"name":"y"},{"name":"z"}]}' \
+  localhost:8000/widgets/batch
+
+# 共享容量触顶（写路由共享上限 8）：换一个调用方把容量挤满后，
+# 仍有自有额度的调用方会收到 429 capacity_exceeded（与 quota_exceeded 区分）
+curl -s -XPOST -H 'X-Api-Key: rot-new-secret' -H 'Idempotency-Key: batch-3' \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"name":"p"},{"name":"q"}]}' localhost:8000/widgets/batch
+
+# 用量自助查询（不消耗额度，可反复轮询）
+curl -s -H 'X-Api-Key: test-key-active' localhost:8000/usage | python3 -m json.tool
 ```
 
 ## 7. 代码结构
@@ -151,15 +227,17 @@ gateway/
   errors.py       网关异常与统一错误响应体
   versioning.py   版本注册表与协商
   credentials.py  凭据哈希、有效期/状态校验、权限域
-  quota.py        原子固定窗口配额（try_acquire / rollback）
+  quota.py        原子固定窗口配额（按量 try_acquire / rollback / 只读 peek）；
+                  同一机制以保留 caller id 承载每路由共享容量
   idempotency.py  幂等存储（首写者语义、重放、冲突、占位释放）
   audit.py        追加式审计与密钥脱敏
-  admission.py    准入流水线（读：全阶段；写：pre-quota + 配额两阶段）
-  routes.py       /widgets 读写路由与错误处理
-  store.py        种子凭据与业务数据
-  deps.py         服务装配
+  admission.py    准入流水线（读：全阶段含共享容量；写：pre-quota 两阶段；
+                  用量查询：仅版本+凭据）
+  routes.py       /widgets 读写、/widgets/batch 批量写、/usage 用量查询
+  store.py        种子凭据、默认限额与共享容量、业务数据
+  deps.py         服务装配（quota 与 capacity 两个独立 QuotaManager）
   app.py          FastAPI 工厂 + /versions
-tests/            版本/凭据/配额(并发)/幂等(并发) 测试
+tests/            版本/凭据/配额(并发)/幂等(并发)/批量与共享容量与用量查询 测试
 ```
 
 所有状态保存在内存中，重启即回到种子数据，适合本地与测试验证。

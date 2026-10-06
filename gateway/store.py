@@ -31,6 +31,15 @@ DEFAULT_LIMITS = {
     ROUTE_WIDGETS_CREATE: 5,
 }
 
+# Per-route capacity shared by *all* callers (backend protection ceiling).
+# Deliberately tight on the write route so the ceiling is observable: two
+# callers with 5 creates each cannot both fit under a shared cap of 8.
+ROUTE_CAPACITY = {
+    ROUTE_WIDGETS_LIST: 1000,
+    ROUTE_WIDGET_DETAIL: 1000,
+    ROUTE_WIDGETS_CREATE: 8,
+}
+
 
 def build_registry(now: datetime) -> CredentialRegistry:
     reg = CredentialRegistry()
