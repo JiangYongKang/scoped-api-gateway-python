@@ -30,6 +30,7 @@ class RejectReason(str, enum.Enum):
     CREDENTIAL_REVOKED = "credential_revoked"
     FORBIDDEN = "forbidden"
     QUOTA_EXCEEDED = "quota_exceeded"
+    CAPACITY_EXCEEDED = "capacity_exceeded"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     NOT_FOUND = "not_found"
     BAD_REQUEST = "bad_request"

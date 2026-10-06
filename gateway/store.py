@@ -31,6 +31,15 @@ DEFAULT_LIMITS = {
     ROUTE_WIDGETS_CREATE: 5,
 }
 
+# Shared per-route capacity ceilings (all callers combined), the
+# backend-protection backstop. Deliberately larger than any single
+# credential's quota so per-credential limits normally bind first.
+DEFAULT_SHARED_CAPACITY = {
+    ROUTE_WIDGETS_LIST: 1000,
+    ROUTE_WIDGET_DETAIL: 1000,
+    ROUTE_WIDGETS_CREATE: 50,
+}
+
 
 def build_registry(now: datetime) -> CredentialRegistry:
     reg = CredentialRegistry()

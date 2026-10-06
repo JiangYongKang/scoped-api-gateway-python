@@ -8,10 +8,11 @@ from __future__ import annotations
 from datetime import datetime
 
 from gateway.audit import AuditLog
+from gateway.capacity import SharedCapacityManager
 from gateway.clock import Clock, SystemClock
 from gateway.idempotency import IdempotencyStore
 from gateway.quota import QuotaManager
-from gateway.store import build_registry, build_widgets
+from gateway.store import DEFAULT_SHARED_CAPACITY, build_registry, build_widgets
 
 
 class FixedClock:
@@ -27,13 +28,17 @@ class FixedClock:
 
 
 def build_services(clock: Clock | None = None,
-                   quota_window_seconds: int = 3600) -> dict:
+                   quota_window_seconds: int = 3600,
+                   shared_capacity: dict[str, int] | None = None) -> dict:
     clock = clock or SystemClock()
     now = clock.now()
     return {
         "clock": clock,
         "registry": build_registry(now),
         "quota": QuotaManager(window_seconds=quota_window_seconds),
+        "capacity": SharedCapacityManager(
+            shared_capacity or DEFAULT_SHARED_CAPACITY,
+            window_seconds=quota_window_seconds),
         "idempotency": IdempotencyStore(),
         "audit": AuditLog(),
         "widgets": build_widgets(),
